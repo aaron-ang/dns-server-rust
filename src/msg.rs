@@ -25,6 +25,7 @@ impl DnsPacket {
 pub struct DnsPacketBuilder {
     questions: Vec<DnsQuestion>,
     answers: Vec<DnsRecord>,
+    request_header: Option<RequestHeader>,
 }
 impl DnsPacketBuilder {
     pub fn add_question(mut self, question: DnsQuestion) -> Self {
@@ -37,20 +38,31 @@ impl DnsPacketBuilder {
         self
     }
 
+    pub fn with_request(mut self, req: RequestHeader) -> Self {
+        self.request_header = Some(req);
+        self
+    }
+
     pub fn build(self) -> DnsPacket {
-        DnsPacket {
-            header: DnsHeader {
-                question_count: self.questions.len() as u16,
-                answer_record_count: self.answers.len() as u16,
+        let qcount = self.questions.len() as u16;
+        let acount = self.answers.len() as u16;
+        let header = match self.request_header {
+            Some(req) => DnsHeader::response_from_request(req, qcount, acount),
+            None => DnsHeader {
+                question_count: qcount,
+                answer_record_count: acount,
                 ..DnsHeader::new()
             },
+        };
+        DnsPacket {
+            header,
             questions: self.questions,
             answers: self.answers,
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 #[allow(dead_code)]
 enum QueryResponse {
     QuestionPacket, // 0 = query
@@ -101,10 +113,33 @@ impl DnsHeader {
         }
     }
 
+    pub fn response_from_request(
+        req: RequestHeader,
+        question_count: u16,
+        answer_count: u16,
+    ) -> Self {
+        let response_code = if req.opcode == 0 { 0 } else { 4 };
+        DnsHeader {
+            packet_id: req.id,
+            query_response_indicator: QueryResponse::ReplyPacket,
+            operation_code: req.opcode,
+            authoritative_answer: false,
+            truncation: false,
+            recursion_desired: req.rd,
+            recursion_available: false,
+            reserved: 0,
+            response_code,
+            question_count,
+            answer_record_count: answer_count,
+            authority_record_count: 0,
+            additional_record_count: 0,
+        }
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = [0u8; 12];
         bytes[0..2].copy_from_slice(&self.packet_id.to_be_bytes());
-        bytes[2] = (self.query_response_indicator.clone() as u8) << 7
+        bytes[2] = (self.query_response_indicator as u8) << 7
             | (self.operation_code << 3)
             | (self.authoritative_answer as u8) << 2
             | (self.truncation as u8) << 1
@@ -159,6 +194,32 @@ impl DnsRecord {
         bytes.extend((self.rdata.len() as u16).to_be_bytes());
         bytes.extend(&self.rdata);
         bytes
+    }
+}
+
+pub struct RequestHeader {
+    pub id: u16,
+    pub opcode: u8,
+    pub rd: bool,
+}
+impl Default for RequestHeader {
+    fn default() -> Self {
+        Self {
+            id: 1234,
+            opcode: 0,
+            rd: false,
+        }
+    }
+}
+impl RequestHeader {
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 12 {
+            return None;
+        }
+        let id = u16::from_be_bytes([bytes[0], bytes[1]]);
+        let opcode = (bytes[2] >> 3) & 0x0F;
+        let rd = (bytes[2] & 1) != 0;
+        Some(Self { id, opcode, rd })
     }
 }
 

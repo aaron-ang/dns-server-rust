@@ -10,8 +10,10 @@ fn main() {
     loop {
         match udp_socket.recv_from(&mut buf) {
             Ok((size, source)) => {
-                println!("Received {} bytes from {}", size, source);
+                println!("Received {size} bytes from {source}");
+                let req = RequestHeader::parse(&buf[..size]).unwrap_or_default();
                 let packet = DnsPacket::builder()
+                    .with_request(req)
                     .add_question(DnsQuestion {
                         name: "codecrafters.io".to_string(),
                         record_class: DnsRecordClass::IN,
@@ -31,7 +33,7 @@ fn main() {
                     .expect("Failed to send response");
             }
             Err(e) => {
-                eprintln!("Error receiving data: {}", e);
+                eprintln!("Error receiving data: {e}");
                 break;
             }
         }
