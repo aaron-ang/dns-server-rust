@@ -1,6 +1,7 @@
 pub struct DnsPacket {
     pub header: DnsHeader,
     pub questions: Vec<DnsQuestion>,
+    pub answers: Vec<DnsRecord>,
 }
 impl DnsPacket {
     pub fn builder() -> DnsPacketBuilder {
@@ -13,6 +14,9 @@ impl DnsPacket {
         for question in &self.questions {
             bytes.extend(question.to_bytes());
         }
+        for answer in &self.answers {
+            bytes.extend(answer.to_bytes());
+        }
         bytes
     }
 }
@@ -20,6 +24,7 @@ impl DnsPacket {
 #[derive(Default)]
 pub struct DnsPacketBuilder {
     questions: Vec<DnsQuestion>,
+    answers: Vec<DnsRecord>,
 }
 impl DnsPacketBuilder {
     pub fn add_question(mut self, question: DnsQuestion) -> Self {
@@ -27,21 +32,29 @@ impl DnsPacketBuilder {
         self
     }
 
+    pub fn add_answer(mut self, answer: DnsRecord) -> Self {
+        self.answers.push(answer);
+        self
+    }
+
     pub fn build(self) -> DnsPacket {
         DnsPacket {
             header: DnsHeader {
                 question_count: self.questions.len() as u16,
+                answer_record_count: self.answers.len() as u16,
                 ..DnsHeader::new()
             },
             questions: self.questions,
+            answers: self.answers,
         }
     }
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 enum QueryResponse {
-    QuestionPacket,
-    ReplyPacket,
+    QuestionPacket, // 0 = query
+    ReplyPacket,    // 1 = response
 }
 
 pub struct DnsHeader {
@@ -75,6 +88,16 @@ impl DnsHeader {
             answer_record_count: 0,
             authority_record_count: 0,
             additional_record_count: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn response(packet_id: u16, question_count: u16, answer_count: u16) -> Self {
+        DnsHeader {
+            packet_id,
+            question_count,
+            answer_record_count: answer_count,
+            ..Self::new()
         }
     }
 
@@ -112,14 +135,39 @@ pub struct DnsQuestion {
 impl DnsQuestion {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        for part in self.name.split('.') {
-            bytes.push(part.len() as u8);
-            bytes.extend(part.as_bytes());
-        }
-        bytes.push(0);
-
+        bytes.extend(encode_domain_name(&self.name));
         bytes.extend((self.record_type as u16).to_be_bytes());
         bytes.extend((self.record_class as u16).to_be_bytes());
         bytes
     }
+}
+
+pub struct DnsRecord {
+    pub name: String,
+    pub record_type: DnsRecordType,
+    pub record_class: DnsRecordClass,
+    pub ttl: u32,
+    pub rdata: Vec<u8>,
+}
+impl DnsRecord {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(encode_domain_name(&self.name));
+        bytes.extend((self.record_type as u16).to_be_bytes());
+        bytes.extend((self.record_class as u16).to_be_bytes());
+        bytes.extend(self.ttl.to_be_bytes());
+        bytes.extend((self.rdata.len() as u16).to_be_bytes());
+        bytes.extend(&self.rdata);
+        bytes
+    }
+}
+
+pub(crate) fn encode_domain_name(name: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for part in name.split('.') {
+        bytes.push(part.len() as u8);
+        bytes.extend(part.as_bytes());
+    }
+    bytes.push(0);
+    bytes
 }

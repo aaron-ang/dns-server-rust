@@ -1,39 +1,82 @@
 use super::*;
 
 #[test]
-fn test_dns_message() {
-    let message = DnsQuestion {
+fn test_dns_question_encoding() {
+    let question = DnsQuestion {
         name: "google.com".to_string(),
         record_type: DnsRecordType::A,
         record_class: DnsRecordClass::IN,
     };
+
+    let expected = question_section_bytes("google.com", DnsRecordType::A, DnsRecordClass::IN);
     assert_eq!(
-        message.to_bytes(),
-        vec![
-            0x06, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d, 0x00, // name
-            0x00, 0x1, // record_type
-            0x0, 0x1 // record_class
-        ]
-    )
+        question.to_bytes(),
+        expected,
+        "question section wire format"
+    );
 }
 
 #[test]
-fn test_dns_packet() {
-    let packet = super::DnsPacket::builder()
+fn test_dns_packet_query_only() {
+    let packet = DnsPacket::builder()
         .add_question(DnsQuestion {
             name: "codecrafters.io".to_string(),
             record_class: DnsRecordClass::IN,
             record_type: DnsRecordType::A,
         })
         .build();
+
+    let expected: Vec<u8> = [
+        DnsHeader::response(1234, 1, 0).to_bytes(),
+        question_section_bytes("codecrafters.io", DnsRecordType::A, DnsRecordClass::IN),
+    ]
+    .concat();
+    assert_eq!(packet.to_bytes(), expected, "packet with question only");
+}
+
+#[test]
+fn test_dns_packet_with_answer() {
+    let packet = DnsPacket::builder()
+        .add_question(DnsQuestion {
+            name: "codecrafters.io".to_string(),
+            record_class: DnsRecordClass::IN,
+            record_type: DnsRecordType::A,
+        })
+        .add_answer(codecrafters_io_a_record(60, vec![8, 8, 8, 8]))
+        .build();
+
+    let expected: Vec<u8> = [
+        DnsHeader::response(1234, 1, 1).to_bytes(),
+        question_section_bytes("codecrafters.io", DnsRecordType::A, DnsRecordClass::IN),
+        codecrafters_io_a_record(60, vec![8, 8, 8, 8]).to_bytes(),
+    ]
+    .concat();
     assert_eq!(
         packet.to_bytes(),
-        vec![
-            0x04, 0xd2, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // header
-            0x0c, 0x63, 0x6f, 0x64, 0x65, 0x63, 0x72, 0x61, 0x66, 0x74, 0x65, 0x72, 0x73, 0x02,
-            0x69, 0x6f, 0x00, // name
-            0x00, 0x01, // record_type
-            0x00, 0x01 // record_class
-        ]
-    )
+        expected,
+        "packet with question and one A answer"
+    );
+}
+
+fn question_section_bytes(
+    name: &str,
+    record_type: DnsRecordType,
+    record_class: DnsRecordClass,
+) -> Vec<u8> {
+    [
+        encode_domain_name(name),
+        (record_type as u16).to_be_bytes().to_vec(),
+        (record_class as u16).to_be_bytes().to_vec(),
+    ]
+    .concat()
+}
+
+fn codecrafters_io_a_record(ttl: u32, ip: Vec<u8>) -> DnsRecord {
+    DnsRecord {
+        name: "codecrafters.io".to_string(),
+        record_type: DnsRecordType::A,
+        record_class: DnsRecordClass::IN,
+        ttl,
+        rdata: ip,
+    }
 }

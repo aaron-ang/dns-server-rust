@@ -17,6 +17,13 @@ fn main() {
                         record_class: DnsRecordClass::IN,
                         record_type: DnsRecordType::A,
                     })
+                    .add_answer(DnsRecord {
+                        name: "codecrafters.io".to_string(),
+                        record_type: DnsRecordType::A,
+                        record_class: DnsRecordClass::IN,
+                        ttl: 60,
+                        rdata: vec![8, 8, 8, 8], // 8.8.8.8
+                    })
                     .build();
                 let response = packet.to_bytes();
                 udp_socket
