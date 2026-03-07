@@ -6,7 +6,7 @@
 #
 # DON'T EDIT THIS!
 [package]
-name = "dns-starter-rust"
+name = "codecrafters-dns-server"
 version = "0.1.0"
 authors = ["Codecrafters <hello@codecrafters.io>"]
 edition = "2021"
@@ -19,8 +19,8 @@ edition = "2021"
 #
 # DON'T EDIT THIS!
 [dependencies]
-anyhow = "1.0.68"          # error handling
-bytes = "1.3.0"            # helps manage buffers
-thiserror = "1.0.38"       # error handling
-nom = "7.1.3"              # parsing
-rand = "0.8.5"             # randomness
+anyhow = "1.0.102"
+bytes = "1.11.1"
+nom = "8.0.0"
+rand = "0.10.0"
+thiserror = "2.0.18"
