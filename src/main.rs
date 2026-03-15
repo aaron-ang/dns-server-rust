@@ -1,23 +1,36 @@
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+
+use clap::Parser;
 
 mod dns;
-use dns::DnsPacket;
+
+const DNS_PORT: u16 = 2053;
+
+#[derive(Parser)]
+struct Args {
+    #[arg(long)]
+    resolver: SocketAddr,
+}
 
 fn main() {
-    let udp_socket = UdpSocket::bind("127.0.0.1:2053").expect("Failed to bind to address");
+    let args = Args::parse();
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, DNS_PORT));
+    let udp_socket = UdpSocket::bind(addr).expect(&format!("failed to bind to {addr}"));
     let mut buf = [0; 512];
 
     loop {
         match udp_socket.recv_from(&mut buf) {
             Ok((size, source)) => {
-                println!("Received {size} bytes from {source}");
-                let response = DnsPacket::response_bytes(&buf[..size]);
-                udp_socket
-                    .send_to(&response, source)
-                    .expect("Failed to send response");
+                if let Some(response) = dns::forward_request(&buf[..size], args.resolver) {
+                    udp_socket
+                        .send_to(&response, source)
+                        .expect("failed to send DNS response");
+                } else {
+                    eprintln!("failed to handle DNS request from {source}");
+                }
             }
-            Err(e) => {
-                eprintln!("Error receiving data: {e}");
+            Err(err) => {
+                eprintln!("error receiving UDP data: {err}");
                 break;
             }
         }
