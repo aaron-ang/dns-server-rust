@@ -1,7 +1,7 @@
 use std::net::UdpSocket;
 
-mod msg;
-use msg::*;
+mod dns;
+use dns::DnsPacket;
 
 fn main() {
     let udp_socket = UdpSocket::bind("127.0.0.1:2053").expect("Failed to bind to address");
@@ -11,23 +11,7 @@ fn main() {
         match udp_socket.recv_from(&mut buf) {
             Ok((size, source)) => {
                 println!("Received {size} bytes from {source}");
-                let req = RequestHeader::parse(&buf[..size]).unwrap_or_default();
-                let packet = DnsPacket::builder()
-                    .with_request(req)
-                    .add_question(DnsQuestion {
-                        name: "codecrafters.io".to_string(),
-                        record_class: DnsRecordClass::IN,
-                        record_type: DnsRecordType::A,
-                    })
-                    .add_answer(DnsRecord {
-                        name: "codecrafters.io".to_string(),
-                        record_type: DnsRecordType::A,
-                        record_class: DnsRecordClass::IN,
-                        ttl: 60,
-                        rdata: vec![8, 8, 8, 8], // 8.8.8.8
-                    })
-                    .build();
-                let response = packet.to_bytes();
+                let response = DnsPacket::response_bytes(&buf[..size]);
                 udp_socket
                     .send_to(&response, source)
                     .expect("Failed to send response");
@@ -39,6 +23,3 @@ fn main() {
         }
     }
 }
-
-#[cfg(test)]
-mod test;
