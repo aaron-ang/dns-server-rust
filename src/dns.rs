@@ -280,9 +280,8 @@ impl DnsRequest {
     /// Parses a DNS request (header + question section) from raw bytes.
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         let header = RequestHeader::parse(bytes)?;
-        // Header is 12 bytes; question section follows.
-        let question_bytes = bytes.get(12..)?;
-        let questions = parse_questions(question_bytes, header.qdcount)?;
+        let mut parser = DnsParser::new(bytes).with_offset(12);
+        let questions = parser.read_questions(header.qdcount)?;
         Some(Self { header, questions })
     }
 }
@@ -297,53 +296,119 @@ pub(crate) fn encode_domain_name(name: &str) -> Vec<u8> {
     buf.to_vec()
 }
 
-fn decode_domain_name_buf<B: Buf>(buf: &mut B) -> Option<String> {
-    let mut labels = Vec::new();
-    loop {
-        if !buf.has_remaining() {
-            return None;
-        }
-        let len = buf.get_u8() as usize;
-        if len == 0 {
-            break;
-        }
-        if buf.remaining() < len {
-            return None;
-        }
-        let mut label = vec![0u8; len];
-        buf.copy_to_slice(&mut label);
-        labels.push(String::from_utf8(label).ok()?);
-    }
-    let name = labels.join(".");
-    Some(name)
+struct DnsParser {
+    msg: Bytes,
+    pos: usize,
 }
 
-pub fn parse_question(bytes: &[u8]) -> Option<(DnsQuestion, &[u8])> {
-    let mut buf = Bytes::copy_from_slice(bytes);
-    let name = decode_domain_name_buf(&mut buf)?;
-    if buf.remaining() < 4 {
-        return None;
+impl DnsParser {
+    fn new(msg: &[u8]) -> Self {
+        Self {
+            msg: Bytes::copy_from_slice(msg),
+            pos: 0,
+        }
     }
-    let record_type = buf.get_u16();
-    let record_class = buf.get_u16();
-    let question = DnsQuestion {
-        name,
-        record_type: (record_type == 1).then_some(DnsRecordType::A)?,
-        record_class: (record_class == 1).then_some(DnsRecordClass::IN)?,
-    };
-    let consumed = bytes.len() - buf.remaining();
-    Some((question, &bytes[consumed..]))
-}
 
-pub fn parse_questions(bytes: &[u8], qdcount: u16) -> Option<Vec<DnsQuestion>> {
-    let mut rest = bytes;
-    let mut questions = Vec::with_capacity(qdcount as usize);
-    for _ in 0..qdcount {
-        let (q, next) = parse_question(rest)?;
-        questions.push(q);
-        rest = next;
+    fn with_offset(mut self, pos: usize) -> Self {
+        self.pos = pos;
+        self
     }
-    Some(questions)
+
+    fn remaining(&self) -> usize {
+        self.msg.len().saturating_sub(self.pos)
+    }
+
+    fn read_u16(&mut self) -> Option<u16> {
+        if self.remaining() < 2 {
+            return None;
+        }
+        let mut buf = self.msg.slice(self.pos..self.pos + 2);
+        let value = buf.get_u16();
+        self.pos += 2;
+        Some(value)
+    }
+
+    /// Decode a (potentially compressed) domain name from a DNS message.
+    /// `offset` is the index from the start of the message (per RFC 1035 section 4.1.4).
+    /// Returns the decoded name and the offset immediately after the original name
+    /// (past the last label or pointer).
+    fn read_domain_name_at(&self, offset: usize) -> Option<(String, usize)> {
+        let mut labels = Vec::new();
+        let mut visited = vec![false; self.msg.len()];
+        let mut pos = offset;
+        let mut next_offset = offset;
+        let mut jumped = false;
+
+        loop {
+            if pos >= self.msg.len() || visited[pos] {
+                return None;
+            }
+            visited[pos] = true;
+
+            let len = self.msg[pos];
+            match len & 0b1100_0000 {
+                0b0000_0000 => {
+                    pos += 1;
+                    if len == 0 {
+                        if !jumped {
+                            next_offset = pos;
+                        }
+                        break;
+                    }
+                    let len = len as usize;
+                    if pos + len > self.msg.len() {
+                        return None;
+                    }
+                    let label = std::str::from_utf8(&self.msg[pos..pos + len]).ok()?;
+                    labels.push(label.to_string());
+                    pos += len;
+                }
+                0b1100_0000 => {
+                    if pos + 1 >= self.msg.len() {
+                        return None;
+                    }
+                    let ptr_offset =
+                        (((len as usize) & 0b0011_1111) << 8) | self.msg[pos + 1] as usize;
+                    if ptr_offset >= self.msg.len() {
+                        return None;
+                    }
+                    if !jumped {
+                        next_offset = pos + 2;
+                        jumped = true;
+                    }
+                    pos = ptr_offset;
+                }
+                _ => return None,
+            }
+        }
+
+        Some((labels.join("."), next_offset))
+    }
+
+    fn read_domain_name(&mut self) -> Option<String> {
+        let (name, next_offset) = self.read_domain_name_at(self.pos)?;
+        self.pos = next_offset;
+        Some(name)
+    }
+
+    fn read_question(&mut self) -> Option<DnsQuestion> {
+        let name = self.read_domain_name()?;
+        let record_type = self.read_u16()?;
+        let record_class = self.read_u16()?;
+        Some(DnsQuestion {
+            name,
+            record_type: (record_type == 1).then_some(DnsRecordType::A)?,
+            record_class: (record_class == 1).then_some(DnsRecordClass::IN)?,
+        })
+    }
+
+    fn read_questions(&mut self, qdcount: u16) -> Option<Vec<DnsQuestion>> {
+        let mut questions = Vec::with_capacity(qdcount as usize);
+        for _ in 0..qdcount {
+            questions.push(self.read_question()?);
+        }
+        Some(questions)
+    }
 }
 
 #[cfg(test)]
@@ -368,18 +433,11 @@ mod tests {
         }
     }
 
-    fn decode_domain_name(bytes: &[u8]) -> Option<(String, &[u8])> {
-        let mut buf = Bytes::copy_from_slice(bytes);
-        let name = decode_domain_name_buf(&mut buf)?;
-        let consumed = bytes.len() - buf.remaining();
-        Some((name, &bytes[consumed..]))
-    }
-
     #[test]
     fn test_dns_question_encoding() {
         let q = question("google.com");
         let wire = q.to_bytes();
-        let (parsed, _) = parse_question(&wire).expect("roundtrip");
+        let parsed = DnsParser::new(&wire).read_question().expect("roundtrip");
         assert_eq!(parsed.name, q.name);
         assert!(matches!(parsed.record_type, DnsRecordType::A));
         assert!(matches!(parsed.record_class, DnsRecordClass::IN));
@@ -431,9 +489,10 @@ mod tests {
     fn test_decode_domain_name() {
         for domain in ["google.com", "codecrafters.io"] {
             let wire = encode_domain_name(domain);
-            let (name, rest) = decode_domain_name(&wire).expect("valid name");
+            let parser = DnsParser::new(&wire);
+            let (name, rest) = parser.read_domain_name_at(0).expect("valid name");
             assert_eq!(name, domain);
-            assert_eq!(rest.len(), 0, "no remainder after full name");
+            assert_eq!(rest, wire.len(), "no remainder after full name");
         }
     }
 
@@ -441,7 +500,8 @@ mod tests {
     fn test_decode_domain_name_roundtrip() {
         for domain in ["google.com", "codecrafters.io", "a.co", "example.org"] {
             let encoded = encode_domain_name(domain);
-            let (decoded, _) = decode_domain_name(&encoded).expect("roundtrip");
+            let parser = DnsParser::new(&encoded);
+            let (decoded, _) = parser.read_domain_name_at(0).expect("roundtrip");
             assert_eq!(decoded, domain, "roundtrip for {domain}");
         }
     }
@@ -450,21 +510,22 @@ mod tests {
     fn test_decode_domain_name_invalid() {
         let mut wire = encode_domain_name("google");
         wire.pop();
-        assert!(decode_domain_name(&wire).is_none());
+        assert!(DnsParser::new(&wire).read_domain_name_at(0).is_none());
 
         let wire = [10u8, b'a', b'b', 0];
-        assert!(decode_domain_name(&wire).is_none());
+        assert!(DnsParser::new(&wire).read_domain_name_at(0).is_none());
     }
 
     #[test]
     fn test_parse_question() {
         let q = question("google.com");
         let wire = q.to_bytes();
-        let (parsed, rest) = parse_question(&wire).expect("valid question");
+        let mut parser = DnsParser::new(&wire);
+        let parsed = parser.read_question().expect("valid question");
         assert_eq!(parsed.name, "google.com");
         assert!(matches!(parsed.record_type, DnsRecordType::A));
         assert!(matches!(parsed.record_class, DnsRecordClass::IN));
-        assert!(rest.is_empty(), "no remainder after one question");
+        assert!(parser.remaining() == 0, "no remainder after one question");
     }
 
     #[test]
@@ -474,7 +535,7 @@ mod tests {
             .chain(5u16.to_be_bytes())
             .chain(1u16.to_be_bytes())
             .collect();
-        assert!(parse_question(&wire).is_none());
+        assert!(DnsParser::new(&wire).read_question().is_none());
     }
 
     #[test]
@@ -505,7 +566,8 @@ mod tests {
         ];
         let mut packet = header_bytes.to_vec();
         packet.extend(q.to_bytes());
-        let questions = parse_questions(&packet[12..], 1).expect("one question");
+        let mut parser = DnsParser::new(&packet).with_offset(12);
+        let questions = parser.read_questions(1).expect("one question");
         assert_eq!(questions.len(), 1);
         assert_eq!(questions[0].name, "google.com");
         assert!(matches!(questions[0].record_type, DnsRecordType::A));
@@ -539,5 +601,105 @@ mod tests {
             request.questions[0].record_class,
             DnsRecordClass::IN
         ));
+    }
+
+    #[test]
+    fn test_dns_request_roundtrip_bytes_with_compression() {
+        // Build a request with two questions:
+        // Q1: full name, Q2: name via compression pointer into Q1.
+        let mut buf = BytesMut::new();
+        buf.put_u16(0x4321); // id
+        buf.put_u8(0x01); // flags: RD=1
+        buf.put_u8(0x00); // flags2
+        buf.put_u16(0x0002); // QDCOUNT = 2
+        buf.put_u16(0x0000); // ANCOUNT
+        buf.put_u16(0x0000); // NSCOUNT
+        buf.put_u16(0x0000); // ARCOUNT
+
+        // Remember start of first QNAME (offset from start of message).
+        let q1_offset = buf.len();
+        let q1 = question("example.com");
+        buf.extend_from_slice(&q1.to_bytes());
+
+        // Q2: compressed name pointing to q1_offset.
+        let pointer = 0xC000 | (q1_offset as u16);
+        buf.put_u16(pointer);
+        buf.put_u16(1); // QTYPE = A
+        buf.put_u16(1); // QCLASS = IN
+
+        let bytes = buf.freeze();
+        let request = DnsRequest::parse(&bytes).expect("parse compressed dns request");
+        assert_eq!(request.header.id, 0x4321);
+        assert_eq!(request.header.qdcount, 2);
+        assert_eq!(request.questions.len(), 2);
+        assert_eq!(request.questions[0].name, "example.com");
+        assert_eq!(request.questions[1].name, "example.com");
+        assert!(matches!(request.questions[0].record_type, DnsRecordType::A));
+        assert!(matches!(request.questions[1].record_type, DnsRecordType::A));
+        assert!(matches!(
+            request.questions[0].record_class,
+            DnsRecordClass::IN
+        ));
+        assert!(matches!(
+            request.questions[1].record_class,
+            DnsRecordClass::IN
+        ));
+    }
+
+    #[test]
+    fn test_decode_domain_name_with_label_prefix_and_pointer() {
+        let mut msg = Vec::new();
+        let suffix_offset = msg.len();
+        msg.extend_from_slice(&encode_domain_name("example.com"));
+        let mixed_offset = msg.len();
+        msg.put_u8(3);
+        msg.extend_from_slice(b"www");
+        msg.put_u16(0xC000 | suffix_offset as u16);
+
+        let parser = DnsParser::new(&msg);
+        let (name, next_offset) = parser
+            .read_domain_name_at(mixed_offset)
+            .expect("mixed name");
+        assert_eq!(name, "www.example.com");
+        assert_eq!(next_offset, mixed_offset + 6);
+    }
+
+    #[test]
+    fn test_decode_domain_name_rejects_self_pointer_cycle() {
+        let msg = [0xC0, 0x00];
+        assert!(DnsParser::new(&msg).read_domain_name_at(0).is_none());
+    }
+
+    #[test]
+    fn test_decode_domain_name_rejects_multi_pointer_cycle() {
+        let msg = [0xC0, 0x02, 0xC0, 0x00];
+        assert!(DnsParser::new(&msg).read_domain_name_at(0).is_none());
+    }
+
+    #[test]
+    fn test_decode_domain_name_rejects_reserved_label_prefixes() {
+        let reserved_01 = [0x40, 0x00];
+        let reserved_10 = [0x80, 0x00];
+        assert!(DnsParser::new(&reserved_01)
+            .read_domain_name_at(0)
+            .is_none());
+        assert!(DnsParser::new(&reserved_10)
+            .read_domain_name_at(0)
+            .is_none());
+    }
+
+    #[test]
+    fn test_parse_questions_standalone_slice_still_roundtrips() {
+        let q1 = question("google.com");
+        let q2 = question("codecrafters.io");
+        let wire: Vec<u8> = [q1.to_bytes(), q2.to_bytes()].concat();
+
+        let mut parser = DnsParser::new(&wire);
+        let questions = parser
+            .read_questions(2)
+            .expect("parse standalone questions");
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].name, "google.com");
+        assert_eq!(questions[1].name, "codecrafters.io");
     }
 }
