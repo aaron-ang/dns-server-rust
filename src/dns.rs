@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 const DNS_HEADER_LEN: usize = 12;
@@ -64,7 +64,7 @@ struct DnsPacket {
 impl DnsPacket {
     fn parse(bytes: &[u8]) -> Option<Self> {
         let header = DnsHeader::parse(bytes)?;
-        let mut parser = DnsParser::new(bytes).with_offset(DNS_HEADER_LEN);
+        let mut parser = DnsReader::new(bytes).with_offset(DNS_HEADER_LEN);
 
         let questions = parser.read_questions(header.question_count)?;
         let answers = parser.read_records(header.answer_record_count)?;
@@ -280,7 +280,7 @@ impl DnsQuestion {
     }
 }
 
-#[derive(Debug,Clone,  PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct DnsRecord {
     name: String,
     record_type: DnsRecordType,
@@ -312,63 +312,44 @@ pub(crate) fn encode_domain_name(name: &str) -> Vec<u8> {
     buf.to_vec()
 }
 
-struct DnsParser {
-    msg: Bytes,
-    offset: usize,
+struct DnsReader<'a> {
+    msg: &'a [u8],
+    cursor: usize,
 }
 
-impl DnsParser {
-    fn new(msg: &[u8]) -> Self {
-        Self {
-            msg: Bytes::copy_from_slice(msg),
-            offset: 0,
-        }
+impl<'a> DnsReader<'a> {
+    fn new(msg: &'a [u8]) -> Self {
+        Self { msg, cursor: 0 }
     }
 
     fn with_offset(mut self, offset: usize) -> Self {
-        self.offset = offset;
+        self.cursor = offset;
         self
     }
 
-    fn remaining(&self) -> usize {
-        self.msg.len().saturating_sub(self.offset)
-    }
-
     fn read_u16(&mut self) -> Option<u16> {
-        if self.remaining() < 2 {
-            return None;
-        }
-        let mut buf = self.msg.slice(self.offset..self.offset + 2);
-        let value = buf.get_u16();
-        self.offset += 2;
-        Some(value)
+        let bytes = self.read_slice(2)?;
+        Some(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
     fn read_u32(&mut self) -> Option<u32> {
-        if self.remaining() < 4 {
-            return None;
-        }
-        let mut buf = self.msg.slice(self.offset..self.offset + 4);
-        let value = buf.get_u32();
-        self.offset += 4;
-        Some(value)
+        let bytes = self.read_slice(4)?;
+        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     fn read_bytes(&mut self, len: usize) -> Option<Vec<u8>> {
-        if self.remaining() < len {
-            return None;
-        }
-        let bytes = self.msg.slice(self.offset..self.offset + len).to_vec();
-        self.offset += len;
-        Some(bytes)
+        Some(self.read_slice(len)?.to_vec())
     }
 
     fn skip_bytes(&mut self, len: usize) -> Option<()> {
-        if self.remaining() < len {
-            return None;
-        }
-        self.offset += len;
+        self.read_slice(len)?;
         Some(())
+    }
+
+    fn read_slice(&mut self, len: usize) -> Option<&'a [u8]> {
+        let bytes = self.msg.get(self.cursor..self.cursor + len)?;
+        self.cursor += len;
+        Some(bytes)
     }
 
     fn read_domain_name_at(&self, offset: usize) -> Option<(String, usize)> {
@@ -429,8 +410,8 @@ impl DnsParser {
     }
 
     fn read_domain_name(&mut self) -> Option<String> {
-        let (name, next_offset) = self.read_domain_name_at(self.offset)?;
-        self.offset = next_offset;
+        let (name, next_offset) = self.read_domain_name_at(self.cursor)?;
+        self.cursor = next_offset;
         Some(name)
     }
 
@@ -550,10 +531,11 @@ mod tests {
     fn test_dns_question_roundtrip() {
         let q = question("google.com");
         let wire = q.to_bytes();
-        let mut parser = DnsParser::new(&wire);
+        let mut parser = DnsReader::new(&wire);
         let parsed = parser.read_question().expect("question roundtrip");
         assert_eq!(parsed, q);
-        assert_eq!(parser.remaining(), 0);
+        let remaining = parser.msg.len().saturating_sub(parser.cursor);
+        assert_eq!(remaining, 0);
     }
 
     #[test]
